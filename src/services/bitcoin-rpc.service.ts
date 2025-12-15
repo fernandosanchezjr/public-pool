@@ -5,182 +5,252 @@ import { BehaviorSubject, filter, shareReplay } from 'rxjs';
 import { RpcBlockService } from '../ORM/rpc-block/rpc-block.service';
 import * as zmq from 'zeromq';
 
+import { RpcBlockEntity } from '../ORM/rpc-block/rpc-block.entity';
 import { IBlockTemplate } from '../models/bitcoin-rpc/IBlockTemplate';
 import { IMiningInfo } from '../models/bitcoin-rpc/IMiningInfo';
 import * as fs from 'node:fs';
+import { Mutex } from 'async-mutex';
+
+const mtx = new Mutex();
 
 @Injectable()
 export class BitcoinRpcService implements OnModuleInit {
+  private blockHeight = 0;
+  private client: RPCClient;
+  private _newBlock$: BehaviorSubject<IMiningInfo> = new BehaviorSubject(
+    undefined,
+  );
+  public newBlock$ = this._newBlock$.pipe(
+    filter((block) => block != null),
+    shareReplay({ refCount: true, bufferSize: 1 }),
+  );
+  private lastBlock: RpcBlockEntity | null = null;
+  private lastBlockTime: any = new Date();
+  private lastMiningInfo: IMiningInfo | null = null;
+  private lastMiningInfoTime: any = new Date();
+  private lastBlockTemplate: IBlockTemplate | null = null;
+  private lastBlockTemplateTime: any = new Date();
 
-    private blockHeight = 0;
-    private client: RPCClient;
-    private _newBlock$: BehaviorSubject<IMiningInfo> = new BehaviorSubject(undefined);
-    public newBlock$ = this._newBlock$.pipe(filter(block => block != null), shareReplay({ refCount: true, bufferSize: 1 }));
+  constructor(
+    private readonly configService: ConfigService,
+    private rpcBlockService: RpcBlockService,
+  ) {}
 
-    constructor(
-        private readonly configService: ConfigService,
-        private rpcBlockService: RpcBlockService
-    ) {
+  async onModuleInit() {
+    const url = this.configService.get('BITCOIN_RPC_URL');
+    let user = this.configService.get('BITCOIN_RPC_USER');
+    let pass = this.configService.get('BITCOIN_RPC_PASSWORD');
+    const port = parseInt(this.configService.get('BITCOIN_RPC_PORT'));
+    const timeout = parseInt(this.configService.get('BITCOIN_RPC_TIMEOUT'));
+
+    const cookiefile = this.configService.get('BITCOIN_RPC_COOKIEFILE');
+
+    if (cookiefile != undefined && cookiefile != '') {
+      const cookie = fs.readFileSync(cookiefile).toString().split(':');
+
+      user = cookie[0];
+      pass = cookie[1];
     }
 
-    async onModuleInit() {
-        const url = this.configService.get('BITCOIN_RPC_URL');
-        let user = this.configService.get('BITCOIN_RPC_USER');
-        let pass = this.configService.get('BITCOIN_RPC_PASSWORD');
-        const port = parseInt(this.configService.get('BITCOIN_RPC_PORT'));
-        const timeout = parseInt(this.configService.get('BITCOIN_RPC_TIMEOUT'));
+    this.client = new RPCClient({ url, port, timeout, user, pass });
 
-        const cookiefile = this.configService.get('BITCOIN_RPC_COOKIEFILE')
+    this.client.getrpcinfo().then(
+      (res) => {
+        console.log('Bitcoin RPC connected');
+      },
+      () => {
+        console.error('Could not reach RPC host');
+      },
+    );
 
-        if (cookiefile != undefined && cookiefile != '') {
-            const cookie = fs.readFileSync(cookiefile).toString().split(':')
+    if (this.configService.get('BITCOIN_ZMQ_HOST')) {
+      console.log('Using ZMQ');
+      const sock = new zmq.Subscriber();
 
-            user = cookie[0]
-            pass = cookie[1]
-        }
+      sock.connectTimeout = 1000;
+      sock.events.on('connect', () => {
+        console.log('ZMQ Connected');
+      });
+      sock.events.on('connect:retry', () => {
+        console.log('ZMQ Unable to connect, Retrying');
+      });
 
-        this.client = new RPCClient({ url, port, timeout, user, pass });
-
-        this.client.getrpcinfo().then((res) => {
-            console.log('Bitcoin RPC connected');
-        }, () => {
-            console.error('Could not reach RPC host');
-        });
-
-        if (this.configService.get('BITCOIN_ZMQ_HOST')) {
-            console.log('Using ZMQ');
-            const sock = new zmq.Subscriber;
-
-
-            sock.connectTimeout = 1000;
-            sock.events.on('connect', () => {
-                console.log('ZMQ Connected');
-            });
-            sock.events.on('connect:retry', () => {
-                console.log('ZMQ Unable to connect, Retrying');
-            });
-
-            sock.connect(this.configService.get('BITCOIN_ZMQ_HOST'));
-            sock.subscribe('rawblock');
-            // Don't await this, otherwise it will block the rest of the program
-            this.listenForNewBlocks(sock);
-            await this.pollMiningInfo();
-
-        } else {
-            setInterval(this.pollMiningInfo.bind(this), 500);
-        }
+      sock.connect(this.configService.get('BITCOIN_ZMQ_HOST'));
+      sock.subscribe('rawblock');
+      // Don't await this, otherwise it will block the rest of the program
+      this.listenForNewBlocks(sock);
+      await this.pollMiningInfo();
+    } else {
+      setInterval(this.pollMiningInfo.bind(this), 500);
     }
+  }
 
-    private async listenForNewBlocks(sock: zmq.Subscriber) {
-        for await (const [topic, msg] of sock) {
-            console.log("New Block");
-            await this.pollMiningInfo();
-        }
+  private async listenForNewBlocks(sock: zmq.Subscriber) {
+    for await (const [topic, msg] of sock) {
+      console.log('New Block');
+      await this.pollMiningInfo();
     }
+  }
 
-    public async pollMiningInfo() {
-        const miningInfo = await this.getMiningInfo();
-        if (miningInfo != null && miningInfo.blocks > this.blockHeight) {
-            console.log("block height change");
-            this._newBlock$.next(miningInfo);
-            this.blockHeight = miningInfo.blocks;
-        }
+  public async pollMiningInfo() {
+    const miningInfo = await this.getMiningInfo();
+    if (miningInfo != null && miningInfo.blocks > this.blockHeight) {
+      console.log('block height change');
+      this._newBlock$.next(miningInfo);
+      this.blockHeight = miningInfo.blocks;
     }
+  }
 
-    private async waitForBlock(blockHeight: number): Promise<IBlockTemplate> {
-        while (true) {
-            await new Promise(r => setTimeout(r, 100));
+  private async getBlock(blockHeight: number): Promise<RpcBlockEntity> {
+    return await mtx.runExclusive(async () => {
+      const now: any = new Date();
+      const age = this.lastBlockTime - now;
+      if (
+        this.lastBlock != null &&
+        this.lastBlock.blockHeight !== blockHeight
+      ) {
+        this.lastBlock = null;
+      }
+      if (this.lastBlock != null && age / 1000 < 60) {
+        return this.lastBlock;
+      }
+      try {
+        const lastBlock = await this.rpcBlockService.getBlock(blockHeight);
+        this.lastBlockTime = new Date();
+        this.lastBlock = lastBlock;
+      } catch (err) {
+        console.error(err);
+      }
 
-            const block = await this.rpcBlockService.getBlock(blockHeight);
-            if (block != null && block.data != null) {
-                console.log(`promise loop resolved, block height ${blockHeight}`);
-                return Promise.resolve(JSON.parse(block.data));
-            }
-            console.log(`promise loop, block height ${blockHeight}`);
-        }
+      return this.lastBlock;
+    });
+  }
+
+  private async waitForBlock(blockHeight: number): Promise<IBlockTemplate> {
+    while (true) {
+      await new Promise((r) => setTimeout(r, 100));
+
+      const block = await this.getBlock(blockHeight);
+      if (block != null && block.data != null) {
+        console.log(`promise loop resolved, block height ${blockHeight}`);
+        return Promise.resolve(JSON.parse(block.data));
+      }
+      console.log(`promise loop, block height ${blockHeight}`);
     }
+  }
 
-    public async getBlockTemplate(blockHeight: number): Promise<IBlockTemplate> {
-        let result: IBlockTemplate;
+  public async getBlockTemplate(blockHeight: number): Promise<IBlockTemplate> {
+    let result: IBlockTemplate;
+
+    try {
+      const block = await this.getBlock(blockHeight);
+      const completeBlock = block?.data != null;
+
+      // If the block has already been loaded, and the same instance is fetching the template again, we just need to refresh it.
+      if (completeBlock && block.lockedBy == process.env.NODE_APP_INSTANCE) {
+        result = await this.loadBlockTemplate(blockHeight);
+      } else if (completeBlock) {
+        return Promise.resolve(JSON.parse(block.data));
+      } else if (!completeBlock) {
+        if (process.env.NODE_APP_INSTANCE != null) {
+          // There is a unique constraint on the block height so if another process tries to lock, it'll throw
+          try {
+            await this.rpcBlockService.lockBlock(
+              blockHeight,
+              process.env.NODE_APP_INSTANCE,
+            );
+          } catch (e) {
+            result = await this.waitForBlock(blockHeight);
+          }
+        }
+        result = await this.loadBlockTemplate(blockHeight);
+      } else {
+        //wait for block
+        result = await this.waitForBlock(blockHeight);
+      }
+    } catch (e) {
+      console.error('Error getblocktemplate:', e.message);
+      throw new Error('Error getblocktemplate');
+    }
+    console.log(`getblocktemplate tx count: ${result.transactions.length}`);
+    return result;
+  }
+
+  private async loadBlockTemplate(blockHeight: number) {
+    let blockTemplate: IBlockTemplate;
+    while (blockTemplate == null) {
+      blockTemplate = await mtx.runExclusive(async () => {
+        const now: any = new Date();
+        const age = this.lastBlockTemplateTime - now;
+        if (
+          this.lastBlockTemplate &&
+          this.lastBlockTemplate.height != this.blockHeight
+        ) {
+          this.lastBlockTemplate = null;
+        }
+        if (this.lastBlockTemplate != null && age / 1000 < 60) {
+          return this.lastBlockTemplate;
+        }
         try {
-            const block = await this.rpcBlockService.getBlock(blockHeight);
-            const completeBlock = block?.data != null;
-
-            // If the block has already been loaded, and the same instance is fetching the template again, we just need to refresh it.
-            if (completeBlock && block.lockedBy == process.env.NODE_APP_INSTANCE) {
-                result = await this.loadBlockTemplate(blockHeight);
-            }
-            else if (completeBlock) {
-                return Promise.resolve(JSON.parse(block.data));
-            } else if (!completeBlock) {
-                if (process.env.NODE_APP_INSTANCE != null) {
-                    // There is a unique constraint on the block height so if another process tries to lock, it'll throw
-                    try {
-                        await this.rpcBlockService.lockBlock(blockHeight, process.env.NODE_APP_INSTANCE);
-                    } catch (e) {
-                        result = await this.waitForBlock(blockHeight);
-                    }
-                }
-                result = await this.loadBlockTemplate(blockHeight);
-            } else {
-                //wait for block
-                result = await this.waitForBlock(blockHeight);
-            }
-        } catch (e) {
-            console.error('Error getblocktemplate:', e.message);
-            throw new Error('Error getblocktemplate');
-        }
-        console.log(`getblocktemplate tx count: ${result.transactions.length}`);
-        return result;
-    }
-
-    private async loadBlockTemplate(blockHeight: number) {
-
-        let blockTemplate: IBlockTemplate;
-        while (blockTemplate == null) {
-            blockTemplate = await this.client.getblocktemplate({
-                template_request: {
-                    rules: ['segwit'],
-                    mode: 'template',
-                    capabilities: ['serverlist', 'proposal']
-                }
-            });
+          const lastBlockTemplate = await this.client.getblocktemplate({
+            template_request: {
+              rules: ['segwit'],
+              mode: 'template',
+              capabilities: ['serverlist', 'proposal'],
+            },
+          });
+          this.lastBlockTemplate = lastBlockTemplate;
+          this.lastBlockTemplateTime = new Date();
+          await this.rpcBlockService.saveBlock(
+            blockHeight,
+            JSON.stringify(lastBlockTemplate),
+          );
+        } catch (err) {
+          console.error(`loadBlockTemplate error:`, err);
         }
 
-
-        await this.rpcBlockService.saveBlock(blockHeight, JSON.stringify(blockTemplate));
-
-        return blockTemplate;
+        return this.lastBlockTemplate;
+      });
     }
 
-    public async getMiningInfo(): Promise<IMiningInfo> {
-        try {
-            return await this.client.getmininginfo();
-        } catch (e) {
-            console.error('Error getmininginfo', e.message);
-            return null;
-        }
+    return blockTemplate;
+  }
 
+  public async getMiningInfo(): Promise<IMiningInfo> {
+    return await mtx.runExclusive(async () => {
+      const now: any = new Date();
+      const age = this.lastMiningInfoTime - now;
+      if (this.lastMiningInfo != null && age / 1000 < 1) {
+        return this.lastMiningInfo;
+      }
+      try {
+        const lastMiningInfo = await this.client.getmininginfo();
+        this.lastMiningInfoTime = new Date();
+        this.lastMiningInfo = lastMiningInfo;
+      } catch (e) {
+        console.error('Error getmininginfo', e.message);
+      }
+
+      return this.lastMiningInfo;
+    });
+  }
+
+  public async SUBMIT_BLOCK(hexdata: string): Promise<string> {
+    let response = 'unknown';
+    try {
+      response = await this.client.submitblock({
+        hexdata,
+      });
+      if (response == null) {
+        response = 'SUCCESS!';
+      }
+      console.log(`BLOCK SUBMISSION RESPONSE: ${response}`);
+      console.log(hexdata);
+      console.log(JSON.stringify(response));
+    } catch (e) {
+      response = e;
+      console.log(`BLOCK SUBMISSION RESPONSE ERROR: ${e}`);
     }
-
-    public async SUBMIT_BLOCK(hexdata: string): Promise<string> {
-        let response: string = 'unknown';
-        try {
-            response = await this.client.submitblock({
-                hexdata
-            });
-            if (response == null) {
-                response = 'SUCCESS!';
-            }
-            console.log(`BLOCK SUBMISSION RESPONSE: ${response}`);
-            console.log(hexdata);
-            console.log(JSON.stringify(response));
-        } catch (e) {
-            response = e;
-            console.log(`BLOCK SUBMISSION RESPONSE ERROR: ${e}`);
-        }
-        return response;
-
-    }
+    return response;
+  }
 }
-
